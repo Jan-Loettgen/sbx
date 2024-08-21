@@ -77,6 +77,9 @@ class SAC(OffPolicyAlgorithmJax):
         seed: Optional[int] = None,
         device: str = "auto",
         _init_setup_model: bool = True,
+        lam_a = 0,
+        lam_s = 0,
+        sigma_LScap = 0
     ) -> None:
         super().__init__(
             policy=policy,
@@ -107,6 +110,10 @@ class SAC(OffPolicyAlgorithmJax):
         self.policy_delay = policy_delay
         self.ent_coef_init = ent_coef
         self.target_entropy = target_entropy
+
+        self.lam_a       = lam_a
+        self.lam_s       = lam_s
+        self.sigma_LScap = sigma_LScap
 
         if _init_setup_model:
             self._setup_model()
@@ -213,7 +220,7 @@ class SAC(OffPolicyAlgorithmJax):
             self.policy.actor_state,
             self.ent_coef_state,
             self.key,
-            (actor_loss_value, qf_loss_value, ent_coef_value),
+            (actor_loss_value, qf_loss_value, ent_coef_value, loss_caps_a, loss_caps_s),
         ) = self._train(
             self.gamma,
             self.tau,
@@ -226,10 +233,15 @@ class SAC(OffPolicyAlgorithmJax):
             self.policy.actor_state,
             self.ent_coef_state,
             self.key,
+            self.lam_a,
+            self.lam_s,
+            self.sigma_LScap
         )
         self._n_updates += gradient_steps
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/actor_loss", actor_loss_value.item())
+        self.logger.record("train/loss_caps_a", loss_caps_a.item())
+        self.logger.record("train/loss_caps_s", loss_caps_s.item())
         self.logger.record("train/critic_loss", qf_loss_value.item())
         self.logger.record("train/ent_coef", ent_coef_value.item())
 
@@ -290,8 +302,12 @@ class SAC(OffPolicyAlgorithmJax):
         ent_coef_state: TrainState,
         observations: jax.Array,
         key: jax.Array,
+        next_observations: jax.Array,
+        lam_a: float,
+        lam_s: float,
+        sigma_LScap: float,
     ):
-        key, dropout_key, noise_key = jax.random.split(key, 3)
+        key, dropout_key, noise_key, obs_bar_key = jax.random.split(key, 4)
 
         def actor_loss(params: flax.core.FrozenDict) -> Tuple[jax.Array, jax.Array]:
             dist = actor_state.apply_fn(params, observations)
@@ -308,12 +324,26 @@ class SAC(OffPolicyAlgorithmJax):
             min_qf_pi = jnp.min(qf_pi, axis=0)
             ent_coef_value = ent_coef_state.apply_fn({"params": ent_coef_state.params})
             actor_loss = (ent_coef_value * log_prob - min_qf_pi).mean()
-            return actor_loss, -log_prob.mean()
 
-        (actor_loss_value, entropy), grads = jax.value_and_grad(actor_loss, has_aux=True)(actor_state.params)
+            dist_next = actor_state.apply_fn(params, next_observations)
+            loss_caps_a = lam_a*((dist_next.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+
+            obs_bar = observations + sigma_LScap * jax.random.normal(obs_bar_key, observations.shape)
+            dist_bar = actor_state.apply_fn(params, obs_bar)
+            loss_caps_s = lam_s*((dist_bar.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+
+            actor_loss += loss_caps_a + loss_caps_s
+            
+            return actor_loss, (-log_prob.mean(), loss_caps_a, loss_caps_s)
+
+        (actor_loss_value, (entropy, loss_caps_a, loss_caps_s)), grads = jax.value_and_grad(actor_loss, has_aux=True)(actor_state.params)
+
         actor_state = actor_state.apply_gradients(grads=grads)
 
-        return actor_state, qf_state, actor_loss_value, key, entropy
+        actor_loss_value -= loss_caps_a
+        actor_loss_value -= loss_caps_s
+
+        return actor_state, qf_state, actor_loss_value, key, entropy, loss_caps_a, loss_caps_s
 
     @staticmethod
     @jax.jit
@@ -343,16 +373,25 @@ class SAC(OffPolicyAlgorithmJax):
         observations: jax.Array,
         target_entropy: ArrayLike,
         key: jax.Array,
+        next_observations: jax.Array,
+        lam_a: float,
+        lam_s: float,
+        sigma_LScap: float,
     ):
-        (actor_state, qf_state, actor_loss_value, key, entropy) = cls.update_actor(
+        (actor_state, qf_state, actor_loss_value, key, entropy, loss_caps_a, loss_caps_s) = cls.update_actor(
             actor_state,
             qf_state,
             ent_coef_state,
             observations,
             key,
+            next_observations,
+            lam_a,
+            lam_s,
+            sigma_LScap,
+
         )
         ent_coef_state, ent_coef_loss_value = cls.update_temperature(target_entropy, ent_coef_state, entropy)
-        return actor_state, qf_state, ent_coef_state, actor_loss_value, ent_coef_loss_value, key
+        return actor_state, qf_state, ent_coef_state, actor_loss_value, ent_coef_loss_value, key, loss_caps_a, loss_caps_s
 
     @classmethod
     @partial(jax.jit, static_argnames=["cls", "gradient_steps", "policy_delay", "policy_delay_offset"])
@@ -369,6 +408,9 @@ class SAC(OffPolicyAlgorithmJax):
         actor_state: TrainState,
         ent_coef_state: TrainState,
         key: jax.Array,
+        lam_a:float,
+        lam_s:float,
+        sigma_LScap:float
     ):
         assert data.observations.shape[0] % gradient_steps == 0
         batch_size = data.observations.shape[0] // gradient_steps
@@ -382,6 +424,8 @@ class SAC(OffPolicyAlgorithmJax):
                 "actor_loss": jnp.array(0.0),
                 "qf_loss": jnp.array(0.0),
                 "ent_coef_loss": jnp.array(0.0),
+                "loss_caps_a" : jnp.array(0.0),
+                "loss_caps_s" : jnp.array(0.0)
             },
         }
 
@@ -416,20 +460,24 @@ class SAC(OffPolicyAlgorithmJax):
             )
             qf_state = cls.soft_update(tau, qf_state)
 
-            (actor_state, qf_state, ent_coef_state, actor_loss_value, ent_coef_loss_value, key) = jax.lax.cond(
+            (actor_state, qf_state, ent_coef_state, actor_loss_value, ent_coef_loss_value, key, loss_caps_a, loss_caps_s) = jax.lax.cond(
                 (policy_delay_offset + i) % policy_delay == 0,
                 # If True:
                 cls.update_actor_and_temperature,
                 # If False:
-                lambda *_: (actor_state, qf_state, ent_coef_state, info["actor_loss"], info["ent_coef_loss"], key),
+                lambda *_: (actor_state, qf_state, ent_coef_state, info["actor_loss"], info["ent_coef_loss"], key, info["loss_caps_a"], info["loss_caps_s"]),
                 actor_state,
                 qf_state,
                 ent_coef_state,
                 batch_obs,
                 target_entropy,
                 key,
+                batch_next_obs,
+                lam_a,
+                lam_s,
+                sigma_LScap,
             )
-            info = {"actor_loss": actor_loss_value, "qf_loss": qf_loss_value, "ent_coef_loss": ent_coef_loss_value}
+            info = {"actor_loss": actor_loss_value, "qf_loss": qf_loss_value, "ent_coef_loss": ent_coef_loss_value, "loss_caps_a":loss_caps_a, "loss_caps_s":loss_caps_s}
 
             return {
                 "actor_state": actor_state,
@@ -446,5 +494,5 @@ class SAC(OffPolicyAlgorithmJax):
             update_carry["actor_state"],
             update_carry["ent_coef_state"],
             update_carry["key"],
-            (update_carry["info"]["actor_loss"], update_carry["info"]["qf_loss"], update_carry["info"]["ent_coef_loss"]),
+            (update_carry["info"]["actor_loss"], update_carry["info"]["qf_loss"], update_carry["info"]["ent_coef_loss"], update_carry["info"]["loss_caps_a"], update_carry["info"]["loss_caps_s"]),
         )
