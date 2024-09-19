@@ -325,12 +325,18 @@ class SAC(OffPolicyAlgorithmJax):
             ent_coef_value = ent_coef_state.apply_fn({"params": ent_coef_state.params})
             actor_loss = (ent_coef_value * log_prob - min_qf_pi).mean()
 
-            dist_next = actor_state.apply_fn(params, next_observations)
-            loss_caps_a = lam_a*((dist_next.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+            if lam_a > 0.0:
+                dist_next = actor_state.apply_fn(params, next_observations)
+                loss_caps_a = lam_a*((dist_next.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+            else:
+                loss_caps_a = 0.0
 
-            obs_bar = observations + sigma_LScap * jax.random.normal(obs_bar_key, observations.shape)
-            dist_bar = actor_state.apply_fn(params, obs_bar)
-            loss_caps_s = lam_s*((dist_bar.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+            if lam_s > 0.0:
+                obs_bar = observations + sigma_LScap * jax.random.normal(obs_bar_key, observations.shape)
+                dist_bar = actor_state.apply_fn(params, obs_bar)
+                loss_caps_s = lam_s*((dist_bar.mode() - dist.mode()) ** 2).mean(axis=1).sum()
+            else:
+                loss_caps_s = 0.0
 
             actor_loss += loss_caps_a + loss_caps_s
             
